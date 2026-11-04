@@ -49,6 +49,13 @@ def run_vectorized_backtest(
             exit_price = price * (1.0 - cost_per_trade)   # Add slippage on sell
             trade_pnl_pct = (exit_price - entry_price) / entry_price
             trade_pnls.append(trade_pnl_pct)
+
+    # Close any open trade at the end of the backtest period using the final closing price
+    if in_position and len(price_series) > 0:
+        in_position = False
+        exit_price = price_series.iloc[-1] * (1.0 - cost_per_trade)
+        trade_pnl_pct = (exit_price - entry_price) / entry_price
+        trade_pnls.append(trade_pnl_pct)
             
     trade_pnls = np.array(trade_pnls)
     

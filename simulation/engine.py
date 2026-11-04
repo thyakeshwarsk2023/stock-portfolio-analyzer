@@ -24,7 +24,7 @@ def run_monte_carlo_nse(
     
     # Daily parameters (converted to float32)
     daily_mu = (np.log(1 + annual_returns[tickers].values) / 252).astype(np.float32)
-    daily_cov = cov_matrix.loc[tickers, tickers].values.astype(np.float32)
+    daily_cov = (cov_matrix.loc[tickers, tickers].values / 252.0).astype(np.float32)
     
     # Cholesky Decomposition with matrix regularization
     try:
