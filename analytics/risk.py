@@ -1,18 +1,94 @@
 # analytics/risk.py
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 RISK_FREE_RATE_INDIA = 0.065  # 6.5% standard RBI G-Sec yield
 
-def calculate_portfolio_series(price_df: pd.DataFrame, weights_dict: Dict[str, float]) -> pd.Series:
-    """Calculates historical normalized portfolio daily value indexed to 1.0."""
-    tickers = list(weights_dict.keys())
-    weights = np.array([weights_dict[t] for t in tickers])
+def calculate_portfolio_series(
+    price_df: pd.DataFrame, 
+    weights_dict: Dict[str, float],
+    rebalance_freq: Optional[str] = None
+) -> pd.Series:
+    """
+    Calculates historical portfolio daily value indexed to 1.0.
+    Supports static Buy-and-Hold or true periodic rebalancing.
     
-    # Normalized prices starting at 1.0
-    normalized_prices = price_df[tickers] / price_df[tickers].iloc[0]
-    portfolio_series = (normalized_prices * weights).sum(axis=1)
+    Parameters:
+    - price_df: DataFrame of historical asset closing prices
+    - weights_dict: Target allocations per ticker (e.g., {'BEL': 0.25, ...})
+    - rebalance_freq: Rebalancing frequency:
+        - None or 'none': Static Buy-and-Hold (weights drift with asset price growth)
+        - 'daily': Rebalanced daily back to target weights
+        - 'monthly': Rebalanced at the start of every calendar month
+        - 'quarterly': Rebalanced at the start of every calendar quarter
+        - 'annually': Rebalanced at the start of every calendar year
+    """
+    tickers = list(weights_dict.keys())
+    target_weights = np.array([weights_dict[t] for t in tickers], dtype=float)
+    weight_sum = np.sum(target_weights)
+    if weight_sum > 0:
+        target_weights = target_weights / weight_sum  # Normalize
+        
+    clean_prices = price_df[tickers].copy()
+    if len(clean_prices) == 0:
+        return pd.Series(dtype=float)
+        
+    freq = (rebalance_freq or "none").strip().lower()
+    
+    # 1. Static Buy-and-Hold (No Rebalancing: weights drift)
+    if freq in ("none", "buy_and_hold", "hold"):
+        normalized_prices = clean_prices / clean_prices.iloc[0]
+        portfolio_series = (normalized_prices * target_weights).sum(axis=1)
+        portfolio_series.name = "Portfolio_BuyAndHold"
+        return portfolio_series
+
+    # 2. Daily Rebalanced Portfolio (Fixed daily weight exposure)
+    if freq == "daily":
+        daily_asset_returns = clean_prices.pct_change().fillna(0.0)
+        daily_port_return = (daily_asset_returns * target_weights).sum(axis=1)
+        portfolio_series = (1.0 + daily_port_return).cumprod()
+        portfolio_series.name = "Portfolio_DailyRebalanced"
+        return portfolio_series
+
+    # 3. Periodic Rebalancing (Monthly, Quarterly, Annually)
+    dates = pd.to_datetime(clean_prices.index)
+    n_days = len(dates)
+    portfolio_values = np.zeros(n_days, dtype=float)
+    portfolio_values[0] = 1.0
+    
+    # Determine rebalance trigger dates
+    is_rebalance_day = np.zeros(n_days, dtype=bool)
+    for i in range(1, n_days):
+        prev_d = dates[i - 1]
+        curr_d = dates[i]
+        
+        if freq == "monthly":
+            if curr_d.month != prev_d.month or curr_d.year != prev_d.year:
+                is_rebalance_day[i] = True
+        elif freq == "quarterly":
+            curr_q = (curr_d.month - 1) // 3
+            prev_q = (prev_d.month - 1) // 3
+            if curr_q != prev_q or curr_d.year != prev_d.year:
+                is_rebalance_day[i] = True
+        elif freq in ("annually", "annual", "yearly"):
+            if curr_d.year != prev_d.year:
+                is_rebalance_day[i] = True
+        else:
+            raise ValueError(f"Unknown rebalance_freq: '{rebalance_freq}'. Expected 'monthly', 'quarterly', 'annually', 'daily', or 'none'.")
+
+    # Simulate wealth evolution with unit-based rebalancing
+    prices_matrix = clean_prices.values
+    current_units = (portfolio_values[0] * target_weights) / prices_matrix[0]
+    
+    for t in range(1, n_days):
+        port_val = float(np.sum(current_units * prices_matrix[t]))
+        portfolio_values[t] = port_val
+        
+        if is_rebalance_day[t]:
+            current_units = (port_val * target_weights) / prices_matrix[t]
+            
+    portfolio_series = pd.Series(portfolio_values, index=clean_prices.index, name=f"Portfolio_{freq.capitalize()}Rebalanced")
     return portfolio_series
 
 def calculate_max_drawdown(series: pd.Series) -> float:
