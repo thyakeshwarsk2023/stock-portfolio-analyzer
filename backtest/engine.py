@@ -8,22 +8,23 @@ def run_vectorized_backtest(
     price_series: pd.Series, 
     signals: pd.Series, 
     initial_capital: float = 500000.0,
-    cost_per_trade: float = 0.0010  # 0.10% covers Indian STT, exchange charges & slippage
+    cost_per_trade: float = 0.0010,  # 0.10% covers Indian STT, exchange charges & slippage
+    execution_timing: str = "close"
 ) -> Dict[str, Any]:
     """
     Executes a vectorized backtest for a single asset trading strategy.
+    Aligns vectorized daily returns and discrete trade ledger execution timing
+    (signals generated at bar t-1 close execute at bar t-1 close / bar t open).
     Calculates institutional risk, performance, and trade distribution metrics.
     """
     # 1. Daily Asset Simple Returns
-    daily_returns = price_series.pct_change().fillna(0.0)
+    daily_returns = price_series.pct_change(fill_method=None).fillna(0.0)
     
     # 2. Identify Trade Entries and Exits (Transitions)
-    # diff() != 0 marks every buy (+1) or sell (-1) trade action
     trade_actions = signals.diff().fillna(0.0)
     is_trade_day = trade_actions != 0.0
     
     # 3. Apply Transaction Friction
-    # Net Daily Strategy Return = (Position * Asset Return) - (Trade Action * Friction)
     friction = is_trade_day.astype(float) * cost_per_trade
     strategy_daily_returns = (signals * daily_returns) - friction
     
@@ -32,23 +33,33 @@ def run_vectorized_backtest(
     buy_hold_curve = initial_capital * (1.0 + daily_returns).cumprod()
     
     # 5. Extract Individual Trade Distributions
-    # Reconstruct trade trade-by-trade PnLs
     trade_pnls = []
     in_position = False
     entry_price = 0.0
     
     for i in range(len(signals)):
         sig = signals.iloc[i]
-        price = price_series.iloc[i]
         
+        # Buy Entry Transition
         if sig == 1.0 and not in_position:
             in_position = True
-            entry_price = price * (1.0 + cost_per_trade)  # Add slippage on buy
+            raw_entry = price_series.iloc[i - 1] if i > 0 else price_series.iloc[0]
+            entry_price = raw_entry * (1.0 + cost_per_trade)
+            
+        # Sell Exit Transition
         elif sig == 0.0 and in_position:
             in_position = False
-            exit_price = price * (1.0 - cost_per_trade)   # Add slippage on sell
+            raw_exit = price_series.iloc[i - 1] if i > 0 else price_series.iloc[0]
+            exit_price = raw_exit * (1.0 - cost_per_trade)
             trade_pnl_pct = (exit_price - entry_price) / entry_price
             trade_pnls.append(trade_pnl_pct)
+
+    # Close any open trade at the end of the backtest period using the final bar's closing price
+    if in_position and len(price_series) > 0:
+        in_position = False
+        exit_price = price_series.iloc[-1] * (1.0 - cost_per_trade)
+        trade_pnl_pct = (exit_price - entry_price) / entry_price
+        trade_pnls.append(trade_pnl_pct)
             
     trade_pnls = np.array(trade_pnls)
     
@@ -98,5 +109,7 @@ def run_vectorized_backtest(
         "Profit Factor": profit_factor,
         "Expectancy Per Trade": expectancy,
         "Avg Win": avg_win,
-        "Avg Loss": avg_loss
+        "Avg Loss": avg_loss,
+        "Equity Curve": equity_curve,
+        "Buy & Hold Curve": buy_hold_curve
     }
