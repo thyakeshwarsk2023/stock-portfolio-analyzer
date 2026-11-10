@@ -10,7 +10,9 @@ if sys.platform == "win32":
 
 import yfinance as yf
 import pandas as pd
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
+
+DEFAULT_INDIAN_GSEC_RF = 0.065  # 6.50% standard 10-Year RBI G-Sec benchmark yield
 
 def format_nse_symbol(symbol: str) -> str:
     """Ensures symbol has .NS suffix for NSE India data."""
@@ -87,25 +89,76 @@ def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
 def fetch_fundamental_info(ticker: str) -> Dict[str, Any]:
     """
     Fetches fundamental financial metrics for an NSE stock 
-    (Market Cap, ROE, Trailing P/E, Sector) for fundamental quality checks.
+    (Market Cap, ROE, Trailing P/E, Sector) with fallback calculations.
     """
     yf_symbol = format_nse_symbol(ticker)
+    data_warning = None
     try:
         ticker_obj = yf.Ticker(yf_symbol)
-        info = ticker_obj.info
+        info = ticker_obj.info or {}
+        
+        market_cap = info.get("marketCap", 0)
+        roe = info.get("returnOnEquity")
+        trailing_pe = info.get("trailingPE")
+        sector = info.get("sector", "Unknown")
+        long_name = info.get("longName", ticker)
+        
+        # Fallback 1: Calculate Trailing P/E from current price and trailing EPS
+        if (trailing_pe is None or trailing_pe == 0.0):
+            current_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+            eps = info.get("trailingEps")
+            if current_price and eps and eps > 0:
+                trailing_pe = round(current_price / eps, 2)
+            elif info.get("forwardPE"):
+                trailing_pe = round(info.get("forwardPE"), 2)
+
+        # Fallback 2: Check alternative ROE fields or ROA
+        if roe is None or roe == 0.0:
+            if "financialData" in info and isinstance(info["financialData"], dict):
+                roe = info["financialData"].get("returnOnEquity")
+            if (roe is None or roe == 0.0) and info.get("returnOnAssets"):
+                roe = info.get("returnOnAssets")
+
+        missing_fields = []
+        if not market_cap:
+            missing_fields.append("Market Cap")
+        if not roe:
+            missing_fields.append("ROE")
+        if not trailing_pe:
+            missing_fields.append("Trailing P/E")
+            
+        if missing_fields:
+            data_warning = f"Metrics {missing_fields} omitted in feed"
+
         return {
-            "marketCap": info.get("marketCap", 0),
-            "returnOnEquity": info.get("returnOnEquity", 0.0),
-            "trailingPE": info.get("trailingPE", 0.0),
-            "sector": info.get("sector", "Unknown"),
-            "longName": info.get("longName", ticker)
+            "marketCap": market_cap or 0,
+            "returnOnEquity": float(roe) if roe else 0.0,
+            "trailingPE": float(trailing_pe) if trailing_pe else 0.0,
+            "sector": sector,
+            "longName": long_name,
+            "data_warning": data_warning
         }
     except Exception as e:
-        print(f"[WARN] Could not fetch fundamental info for {ticker}: {e}")
         return {
             "marketCap": 0,
             "returnOnEquity": 0.0,
             "trailingPE": 0.0,
             "sector": "Unknown",
-            "longName": ticker
+            "longName": ticker,
+            "data_warning": f"Data error: {str(e)}"
         }
+
+
+def fetch_indian_risk_free_rate(custom_rf: Optional[float] = None) -> float:
+    """
+    Determines the risk-free rate for Indian equity analytics:
+    - If custom_rf is provided, validates and applies it.
+    - Otherwise, defaults to the standard RBI 10Y G-Sec benchmark rate (6.50%).
+    """
+    if custom_rf is not None and 0.01 <= custom_rf <= 0.20:
+        print(f"[CONFIG] Risk-Free Rate: {custom_rf:.2%} (Custom Override)")
+        return custom_rf
+
+    rf = DEFAULT_INDIAN_GSEC_RF
+    print(f"[CONFIG] Risk-Free Rate: {rf:.2%} (RBI 10Y G-Sec Benchmark)")
+    return rf
