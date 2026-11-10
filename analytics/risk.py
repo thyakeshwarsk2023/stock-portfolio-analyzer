@@ -24,18 +24,33 @@ def calculate_max_drawdown(series: pd.Series) -> float:
 def calculate_sortino_ratio(
     daily_log_returns: pd.Series, 
     annual_return: float, 
-    risk_free_rate: float = RISK_FREE_RATE_INDIA
+    risk_free_rate: float = RISK_FREE_RATE_INDIA,
+    target_return: float = 0.0
 ) -> float:
-    """Calculates annualized Sortino Ratio focusing strictly on downside deviation."""
+    """
+    Calculates annualized Sortino Ratio focusing strictly on downside deviation.
+    Uses root-mean-square downside deviation (RMSDD) below target_return (default 0.0).
+    """
+    if len(daily_log_returns) == 0:
+        return 0.0
+
     # Convert daily log returns to daily simple returns
-    simple_returns = np.exp(daily_log_returns) - 1
-    negative_returns = simple_returns[simple_returns < 0]
+    simple_returns = np.exp(daily_log_returns) - 1.0
     
-    if len(negative_returns) == 0 or negative_returns.std() == 0:
+    # Daily target threshold (default 0.0 for negative returns/losses)
+    daily_target = target_return / 252.0
+    downside = np.minimum(simple_returns - daily_target, 0.0)
+    
+    # Root-mean-square downside deviation across all N periods
+    downside_variance = np.mean(downside ** 2)
+    if downside_variance <= 0.0:
         return 0.0
         
-    downside_std_annual = negative_returns.std() * np.sqrt(252)
-    return (annual_return - risk_free_rate) / downside_std_annual
+    downside_std_annual = np.sqrt(downside_variance) * np.sqrt(252)
+    if downside_std_annual == 0.0:
+        return 0.0
+        
+    return float((annual_return - risk_free_rate) / downside_std_annual)
 
 def calculate_risk_metrics(
     portfolio_series: pd.Series, 
