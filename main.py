@@ -236,14 +236,16 @@ def main():
     print("============================================================================")
 
     # 7. Vectorized Correlated Monte Carlo Simulation Engine
-    print(f"\nRunning {simulations:,} Correlated Monte Carlo Simulations over {years} Years...")
+    mc_mode_label = "Static Drift" if rebalance_freq in (None, "none") else f"Rebalanced ({rebalance_freq.capitalize()})"
+    print(f"\nRunning {simulations:,} Correlated Monte Carlo Simulations over {years} Years  [{mc_mode_label}]...")
     sim_results = run_monte_carlo_nse(
         annual_returns=ann_returns,
         cov_matrix=cov_matrix,
         weights_dict=portfolio_config,
         initial_investment_inr=initial_investment,
         years=years,
-        n_simulations=simulations
+        n_simulations=simulations,
+        rebalance_freq=rebalance_freq,
     )
     
     # 8. Output Monte Carlo Percentile Projections

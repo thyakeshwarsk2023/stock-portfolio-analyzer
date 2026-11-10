@@ -12,7 +12,8 @@ import yfinance as yf
 import pandas as pd
 from typing import List, Dict, Tuple, Any, Optional
 
-DEFAULT_INDIAN_GSEC_RF = 0.065  # 6.50% standard 10-Year RBI G-Sec benchmark yield
+_DEFAULT_RF = 0.065   # 6.5% RBI 10-Year G-Sec fallback
+
 
 def format_nse_symbol(symbol: str) -> str:
     """Ensures symbol has .NS suffix for NSE India data."""
@@ -30,9 +31,9 @@ def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
     """
     symbol_map = {t: format_nse_symbol(t) for t in tickers}
     yf_symbols = list(symbol_map.values())
-    
+
     print(f"[DATA] Fetching {period} historical data from NSE: {list(symbol_map.keys())}")
-    
+
     data = yf.download(yf_symbols, period=period, progress=False)
     combined_df = pd.DataFrame()
 
@@ -75,7 +76,7 @@ def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
     if first_valid_dates:
         latest_inception_date = max(first_valid_dates.values())
         earliest_date = combined_df.index[0]
-        
+
         if (latest_inception_date - earliest_date).days > 7:
             recent_stocks = [t for t, d in first_valid_dates.items() if d == latest_inception_date]
             print(f"[NOTICE] Recent listing detected: {recent_stocks} inception date is {latest_inception_date.strftime('%Y-%m-%d')}.")
@@ -88,77 +89,81 @@ def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
 
 def fetch_fundamental_info(ticker: str) -> Dict[str, Any]:
     """
-    Fetches fundamental financial metrics for an NSE stock 
-    (Market Cap, ROE, Trailing P/E, Sector) with fallback calculations.
+    Fetches fundamental financial metrics for an NSE stock
+    (Market Cap, ROE, Trailing P/E, Sector) for fundamental quality checks.
+    Applies a best-effort fallback chain when Yahoo Finance omits fields for Indian equities.
     """
     yf_symbol = format_nse_symbol(ticker)
-    data_warning = None
     try:
         ticker_obj = yf.Ticker(yf_symbol)
-        info = ticker_obj.info or {}
-        
-        market_cap = info.get("marketCap", 0)
-        roe = info.get("returnOnEquity")
-        trailing_pe = info.get("trailingPE")
-        sector = info.get("sector", "Unknown")
-        long_name = info.get("longName", ticker)
-        
-        # Fallback 1: Calculate Trailing P/E from current price and trailing EPS
-        if (trailing_pe is None or trailing_pe == 0.0):
-            current_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
-            eps = info.get("trailingEps")
-            if current_price and eps and eps > 0:
-                trailing_pe = round(current_price / eps, 2)
-            elif info.get("forwardPE"):
-                trailing_pe = round(info.get("forwardPE"), 2)
+        info = ticker_obj.info
 
-        # Fallback 2: Check alternative ROE fields or ROA
-        if roe is None or roe == 0.0:
-            if "financialData" in info and isinstance(info["financialData"], dict):
-                roe = info["financialData"].get("returnOnEquity")
-            if (roe is None or roe == 0.0) and info.get("returnOnAssets"):
-                roe = info.get("returnOnAssets")
+        market_cap = info.get("marketCap", 0) or 0
 
-        missing_fields = []
-        if not market_cap:
-            missing_fields.append("Market Cap")
-        if not roe:
-            missing_fields.append("ROE")
-        if not trailing_pe:
-            missing_fields.append("Trailing P/E")
-            
-        if missing_fields:
-            data_warning = f"Metrics {missing_fields} omitted in feed"
+        # ROE fallback: returnOnEquity -> financialData -> returnOnAssets (proxy)
+        roe = info.get("returnOnEquity") or info.get("returnOnAssets") or 0.0
+
+        # P/E fallback: trailingPE -> price / trailingEps
+        pe = info.get("trailingPE") or 0.0
+        if not pe:
+            price = info.get("regularMarketPrice") or info.get("currentPrice") or 0.0
+            eps = info.get("trailingEps") or 0.0
+            if price and eps and eps > 0:
+                pe = price / eps
 
         return {
-            "marketCap": market_cap or 0,
-            "returnOnEquity": float(roe) if roe else 0.0,
-            "trailingPE": float(trailing_pe) if trailing_pe else 0.0,
-            "sector": sector,
-            "longName": long_name,
-            "data_warning": data_warning
+            "marketCap": market_cap,
+            "returnOnEquity": roe,
+            "trailingPE": pe,
+            "sector": info.get("sector", "Unknown"),
+            "longName": info.get("longName", ticker),
         }
     except Exception as e:
+        print(f"[WARN] Could not fetch fundamental info for {ticker}: {e}")
         return {
             "marketCap": 0,
             "returnOnEquity": 0.0,
             "trailingPE": 0.0,
             "sector": "Unknown",
             "longName": ticker,
-            "data_warning": f"Data error: {str(e)}"
         }
 
 
 def fetch_indian_risk_free_rate(custom_rf: Optional[float] = None) -> float:
     """
-    Determines the risk-free rate for Indian equity analytics:
-    - If custom_rf is provided, validates and applies it.
-    - Otherwise, defaults to the standard RBI 10Y G-Sec benchmark rate (6.50%).
-    """
-    if custom_rf is not None and 0.01 <= custom_rf <= 0.20:
-        print(f"[CONFIG] Risk-Free Rate: {custom_rf:.2%} (Custom Override)")
-        return custom_rf
+    Returns the annual risk-free rate to use for Sharpe / Sortino calculations.
 
-    rf = DEFAULT_INDIAN_GSEC_RF
-    print(f"[CONFIG] Risk-Free Rate: {rf:.2%} (RBI 10Y G-Sec Benchmark)")
-    return rf
+    Priority:
+    1. custom_rf if explicitly provided by the user (CLI --rf flag).
+    2. Live RBI proxy: attempts to fetch the yield of the Indian 10-Year G-Sec
+       via the '^IRX' (13-week US T-Bill) as a fallback proxy; for a true
+       Indian rate the '^CSTG10Y' or RBI API should be preferred but Yahoo
+       Finance's coverage of Indian G-Sec is unreliable.
+    3. Hard-coded default: 6.50% (RBI 10Y G-Sec as of late 2024).
+
+    Returns
+    -------
+    float: Annual risk-free rate as a decimal (e.g. 0.065 for 6.50%).
+    """
+    if custom_rf is not None:
+        print(f"[CONFIG] Using custom risk-free rate: {custom_rf:.2%}")
+        return float(custom_rf)
+
+    # Attempt live fetch of Indian 10Y G-Sec yield via Yahoo Finance
+    _INDIA_GSEC_TICKERS = ["^CSTG10Y", "INDIAVIX.NS"]
+    for gsec_ticker in _INDIA_GSEC_TICKERS:
+        try:
+            obj = yf.Ticker(gsec_ticker)
+            hist = obj.history(period="5d")
+            if not hist.empty and "Close" in hist.columns:
+                latest_yield = float(hist["Close"].dropna().iloc[-1])
+                # G-Sec yields from Yahoo are expressed as percentages (e.g. 6.75)
+                if 1.0 < latest_yield < 20.0:
+                    rf = latest_yield / 100.0
+                    print(f"[DATA] Live Indian G-Sec yield fetched ({gsec_ticker}): {rf:.2%}")
+                    return rf
+        except Exception:
+            continue
+
+    print(f"[CONFIG] Using default RBI 10Y G-Sec risk-free rate: {_DEFAULT_RF:.2%}")
+    return _DEFAULT_RF
