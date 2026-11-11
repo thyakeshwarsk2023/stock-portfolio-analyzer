@@ -113,6 +113,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cov-halflife", type=int, default=126, help="EWMA half-life in trading days for covariance estimation")
     parser.add_argument("--drift-halflife", type=int, default=None, help="Optional EWMA half-life in trading days for Monte Carlo drift")
     parser.add_argument("--no-covid-filter", action="store_true", help="Keep Feb-May 2020 COVID-19 outlier window in drift/cov calculations")
+    parser.add_argument("--enforce-fundamentals", action="store_true", help="Drop stocks failing fundamental gate and re-normalize weights")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible Monte Carlo runs")
     parser.add_argument("--rf", type=float, default=None, help="Custom annual Risk-Free Rate (e.g. 0.065 for 6.5%%)")
     parser.add_argument("--no-plot", action="store_true", help="Skip generating and saving chart figures")
     parser.add_argument("--plot-file", type=str, default="portfolio_report.png", help="Path to save high-res PNG visual report")
@@ -201,6 +203,21 @@ def main():
     
     if rejected_tickers:
         print(f"\n[NOTICE] Assets failing fundamental quality gate: {rejected_tickers}")
+        if args.enforce_fundamentals:
+            if not passed_tickers:
+                print("[ERROR] All portfolio assets failed fundamental quality gate under --enforce-fundamentals.")
+                return
+            kept_total = sum(portfolio_config[t] for t in passed_tickers)
+            portfolio_config = {t: portfolio_config[t] / kept_total for t in passed_tickers}
+            tickers = passed_tickers
+            weights_fmt = ", ".join(f"{t}:{w:.1%}" for t, w in portfolio_config.items())
+            print(f"[FILTER] Enforced fundamental gate. Re-normalized allocation: {weights_fmt}")
+            portfolio_series = calculate_portfolio_series(prices, portfolio_config, rebalance_freq=rebalance_freq)
+            _, nifty_norm = evaluate_benchmark_comparison(
+                portfolio_prices=portfolio_series,
+                period=args.period,
+                risk_free_rate=rf
+            )
     else:
         print("[OK] All portfolio assets passed the institutional fundamental quality gate.")
     print("===========================================================================")
@@ -255,6 +272,7 @@ def main():
         initial_investment_inr=initial_investment,
         years=years,
         n_simulations=simulations,
+        seed=args.seed,
         rebalance_freq=rebalance_freq,
     )
     

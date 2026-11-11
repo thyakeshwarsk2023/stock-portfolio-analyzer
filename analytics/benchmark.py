@@ -1,10 +1,9 @@
 # analytics/benchmark.py
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from typing import Optional, Tuple
 from analytics.risk import calculate_risk_metrics, RISK_FREE_RATE_INDIA
-from data.fetch import sanitize_bad_ticks
+from data.fetch import fetch_nse_data
 
 # NIFTYBEES.NS is the Nippon India ETF Nifty BeES — a Total Return (TRI) proxy
 # for the Nifty 50. Dividends are reinvested into NAV, eliminating the
@@ -17,28 +16,13 @@ _BENCHMARK_LABEL  = "Nifty 50 TRI (NIFTYBEES)"
 def fetch_nifty50_benchmark(period: str = "5y") -> pd.DataFrame:
     """
     Fetches Nifty 50 Total Return benchmark via NIFTYBEES.NS ETF.
-    Returns adjusted close prices as a single-column DataFrame labelled 'NIFTY50'.
-    Guarantees a timezone-naive DatetimeIndex for cross-dataset compatibility.
+    Reuses fetch_nse_data for retry resilience, auto_adjust, timezone cleanup,
+    and bad-tick repair.
     """
-    df = yf.download(_BENCHMARK_TICKER, period=period, progress=False, auto_adjust=True)
-
-    if ("Close", _BENCHMARK_TICKER) in df.columns:
-        prices = df[("Close", _BENCHMARK_TICKER)]
-    elif "Close" in df.columns:
-        prices = df["Close"]
-    else:
+    df = fetch_nse_data([_BENCHMARK_TICKER], period=period)
+    if _BENCHMARK_TICKER not in df.columns or df[_BENCHMARK_TICKER].empty:
         raise ValueError(f"Could not extract Close prices for {_BENCHMARK_TICKER}.")
-
-    if isinstance(prices, pd.DataFrame):
-        prices = prices.iloc[:, 0]
-
-    # Normalize index to timezone-naive and repair transient feed bad ticks
-    if prices.index.tz is not None:
-        prices.index = prices.index.tz_localize(None)
-
-    prices = sanitize_bad_ticks(prices.dropna().sort_index(), label=_BENCHMARK_TICKER)
-
-    return pd.DataFrame({"NIFTY50": prices}).dropna().ffill()
+    return pd.DataFrame({"NIFTY50": df[_BENCHMARK_TICKER]}).dropna().ffill()
 
 
 def evaluate_benchmark_comparison(
