@@ -9,6 +9,7 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8")
 
 import logging
+import time
 import yfinance as yf
 import pandas as pd
 from typing import List, Dict, Tuple, Any, Optional
@@ -24,45 +25,108 @@ def format_nse_symbol(symbol: str) -> str:
     return f"{symbol}.NS"
 
 
-def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
+def sanitize_bad_ticks(prices: pd.Series, label: str = "") -> pd.Series:
     """
-    Fetches historical closing prices and daily volume for Indian equities.
-    Truncates the historical window to the common inception date of all assets
-    to eliminate artificial 0% return/volatility distortions from backward-filling recent IPOs.
+    Detects and repairs transient Yahoo Finance feed glitches (e.g. 10x decimal
+    omissions) where price temporarily drops >65% or spikes >200% and reverts
+    within 1-3 trading days.
+    """
+    clean = prices.dropna().sort_index()
+    if len(clean) < 5:
+        return prices
+
+    bad_tick_mask = pd.Series(False, index=clean.index)
+    for lag in (1, 2, 3):
+        prev_ok = clean.shift(lag)
+        for lead in (1, 2, 3):
+            next_ok = clean.shift(-lead)
+            bad_tick_mask |= (clean < prev_ok * 0.35) & (next_ok > clean * 3.0)
+            bad_tick_mask |= (clean > prev_ok * 3.0) & (next_ok < clean * 0.35)
+
+    if bad_tick_mask.any():
+        bad_dates = [d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d) for d in clean.index[bad_tick_mask]]
+        tag = f" in {label}" if label else ""
+        print(f"[DATA] Repaired {int(bad_tick_mask.sum())} Yahoo Finance bad tick(s){tag}: {bad_dates}")
+        clean = clean.mask(bad_tick_mask).interpolate(method="linear")
+        return clean.reindex(prices.index)
+
+    return prices
+
+
+def _extract_ticker_series(data: pd.DataFrame, yf_symbol: str, is_single: bool) -> Tuple[Optional[pd.Series], Optional[pd.Series]]:
+    """Extracts Close and Volume series cleanly regardless of single vs MultiIndex columns."""
+    price_col = None
+    vol_col = None
+
+    if isinstance(data.columns, pd.MultiIndex):
+        if ("Close", yf_symbol) in data.columns:
+            price_col = data[("Close", yf_symbol)]
+        elif ("Adj Close", yf_symbol) in data.columns:
+            price_col = data[("Adj Close", yf_symbol)]
+        if ("Volume", yf_symbol) in data.columns:
+            vol_col = data[("Volume", yf_symbol)]
+    elif is_single:
+        if "Close" in data.columns:
+            price_col = data["Close"]
+        elif "Adj Close" in data.columns:
+            price_col = data["Adj Close"]
+        if "Volume" in data.columns:
+            vol_col = data["Volume"]
+
+    if isinstance(price_col, pd.DataFrame):
+        price_col = price_col.iloc[:, 0]
+    if isinstance(vol_col, pd.DataFrame):
+        vol_col = vol_col.iloc[:, 0]
+
+    return price_col, vol_col
+
+
+def fetch_nse_data(tickers: List[str], period: str = "5y", max_retries: int = 2) -> pd.DataFrame:
+    """
+    Fetches adjusted historical closing prices and daily volume for Indian equities.
+    Uses explicit auto_adjust=True, exponential-backoff retries for transient Yahoo
+    failures, shared bad-tick repair, and common-inception truncation.
     """
     symbol_map = {t: format_nse_symbol(t) for t in tickers}
     yf_symbols = list(symbol_map.values())
 
     print(f"[DATA] Fetching {period} historical data from NSE: {list(symbol_map.keys())}")
 
-    data = yf.download(yf_symbols, period=period, progress=False)
     combined_df = pd.DataFrame()
+    pending = dict(symbol_map)
 
-    # Case 1: Single Ticker Download
-    if len(tickers) == 1:
-        ticker = tickers[0]
-        if "Adj Close" in data:
-            combined_df[ticker] = data["Adj Close"]
-        elif "Close" in data:
-            combined_df[ticker] = data["Close"]
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            delay = 2 ** (attempt - 1)
+            print(f"[DATA] Retrying missing ticker(s) {list(pending.keys())} (attempt {attempt}/{max_retries}, wait {delay}s)...")
+            time.sleep(delay)
 
-        if "Volume" in data:
-            combined_df[f"{ticker}_Volume"] = data["Volume"]
+        req_symbols = list(pending.values())
+        data = yf.download(req_symbols, period=period, progress=False, auto_adjust=True)
+        if data.empty:
+            continue
 
-    # Case 2: Multiple Tickers Download
-    else:
-        for orig_ticker, yf_symbol in symbol_map.items():
-            if ("Adj Close", yf_symbol) in data.columns:
-                combined_df[orig_ticker] = data[("Adj Close", yf_symbol)]
-            elif ("Close", yf_symbol) in data.columns:
-                combined_df[orig_ticker] = data[("Close", yf_symbol)]
+        is_single = len(req_symbols) == 1
+        still_missing = {}
+        for orig_ticker, yf_symbol in pending.items():
+            p_col, v_col = _extract_ticker_series(data, yf_symbol, is_single)
+            if p_col is not None and not p_col.dropna().empty:
+                combined_df[orig_ticker] = sanitize_bad_ticks(p_col, label=yf_symbol)
+                if v_col is not None:
+                    combined_df[f"{orig_ticker}_Volume"] = v_col
+            else:
+                still_missing[orig_ticker] = yf_symbol
 
-            if ("Volume", yf_symbol) in data.columns:
-                combined_df[f"{orig_ticker}_Volume"] = data[("Volume", yf_symbol)]
+        pending = still_missing
+        if not pending:
+            break
 
     combined_df = combined_df.dropna(how="all")
     if combined_df.empty:
         return combined_df
+
+    if combined_df.index.tz is not None:
+        combined_df.index = combined_df.index.tz_localize(None)
 
     # Common Inception Date Alignment
     price_cols = [t for t in tickers if t in combined_df.columns]
@@ -73,6 +137,9 @@ def fetch_nse_data(tickers: List[str], period: str = "5y") -> pd.DataFrame:
             first_valid_dates[t] = f_idx
         else:
             print(f"[WARN] No price history returned for ticker '{t}'.")
+
+    for missing_t in pending:
+        print(f"[WARN] No price history returned for ticker '{missing_t}' after {max_retries + 1} attempts.")
 
     if first_valid_dates:
         latest_inception_date = max(first_valid_dates.values())
