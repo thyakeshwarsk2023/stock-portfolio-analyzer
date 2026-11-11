@@ -91,7 +91,11 @@ def fetch_fundamental_info(ticker: str) -> Dict[str, Any]:
     """
     Fetches fundamental financial metrics for an NSE stock
     (Market Cap, ROE, Trailing P/E, Sector) for fundamental quality checks.
-    Applies a best-effort fallback chain when Yahoo Finance omits fields for Indian equities.
+    Applies a best-effort multi-stage fallback chain:
+    1. Direct yfinance info attributes.
+    2. Primary statement recovery (balance sheet Net Income / Stockholder Equity)
+       for Indian PSUs and conglomerates where Yahoo info omits ROE.
+    3. Trailing P/E calculation from currentPrice / trailingEps if trailingPE is missing.
     """
     yf_symbol = format_nse_symbol(ticker)
     try:
@@ -100,8 +104,30 @@ def fetch_fundamental_info(ticker: str) -> Dict[str, Any]:
 
         market_cap = info.get("marketCap", 0) or 0
 
-        # ROE fallback: returnOnEquity -> financialData -> returnOnAssets (proxy)
-        roe = info.get("returnOnEquity") or info.get("returnOnAssets") or 0.0
+        # Primary ROE lookup
+        roe = info.get("returnOnEquity")
+
+        # Fallback 1: Balance sheet / Financials statement calculation (recovers HAL, defence PSUs)
+        if roe is None or roe == 0.0:
+            try:
+                bs = ticker_obj.balance_sheet
+                fin = ticker_obj.financials
+                if not bs.empty and not fin.empty:
+                    eq = 0
+                    if "Common Stock Equity" in bs.index:
+                        eq = bs.loc["Common Stock Equity"].iloc[0]
+                    elif "Stockholders Equity" in bs.index:
+                        eq = bs.loc["Stockholders Equity"].iloc[0]
+
+                    ni = fin.loc["Net Income"].iloc[0] if "Net Income" in fin.index else 0
+                    if eq and eq > 0 and ni:
+                        roe = float(ni / eq)
+            except Exception:
+                pass
+
+        # Fallback 2: ROA proxy if ROE still unresolvable
+        if roe is None or roe == 0.0:
+            roe = info.get("returnOnAssets") or 0.0
 
         # P/E fallback: trailingPE -> price / trailingEps
         pe = info.get("trailingPE") or 0.0
