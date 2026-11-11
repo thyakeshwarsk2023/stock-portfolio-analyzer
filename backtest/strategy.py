@@ -1,6 +1,7 @@
 # backtest/strategy.py
 import pandas as pd
 import numpy as np
+import scipy.signal as sig
 from typing import Dict, Any, Tuple, List, Optional
 
 
@@ -12,9 +13,9 @@ def calculate_wilder_rsi(price_series: pd.Series, period: int = 14) -> pd.Series
       - AvgGain[period] = simple mean of first `period` gains.
       - Subsequent bars: AvgGain[i] = AvgGain[i-1] * (1 - 1/N) + Gain[i] * (1/N).
 
-    The smoothing loop is implemented in pure NumPy array operations via
-    a manual cumulative product expansion — avoiding the Python-level `for`
-    loop for all bars after the seed point.
+    Implemented via scipy.signal.lfilter — a compiled C-level 1st-order IIR
+    recursion. Eliminates both the Python-level for-loop and the numerical
+    underflow risks of explicit power division on long time horizons.
     """
     if len(price_series) <= period:
         return pd.Series(np.nan, index=price_series.index)
@@ -29,41 +30,26 @@ def calculate_wilder_rsi(price_series: pd.Series, period: int = 14) -> pd.Series
     alpha = 1.0 / period
     decay = 1.0 - alpha
 
-    # --- Seed: simple mean of first `period` changes (index 0..period-1 of deltas) ---
-    seed_g = np.mean(gains[:period])
-    seed_l = np.mean(losses[:period])
+    # Seed: simple mean of first `period` changes (index 0..period-1 of deltas)
+    seed_g = float(np.mean(gains[:period]))
+    seed_l = float(np.mean(losses[:period]))
 
-    # --- Vectorized Wilder smoothing using cumulative decay weights ---
-    # For bars period+1 .. n-1, the smoothed value is:
-    #   S[k] = seed * decay^k + alpha * sum_{j=1}^{k} input[period-1+j] * decay^(k-j)
-    # Computed via: np.cumsum(input * weights) / cumulative_weight_normalization
-    # This avoids the Python for-loop entirely.
-
-    tail_g = gains[period:]          # shape (m,)   m = n - period - 1
+    tail_g = gains[period:]
     tail_l = losses[period:]
-    m = len(tail_g)
 
-    if m == 0:
+    # Compiled C IIR recursion: y[k] = decay * y[k-1] + alpha * x[k]
+    # Setting initial delay condition zi = [seed * decay] guarantees y[0] matches Wilder recursion
+    b = [alpha]
+    a = [1.0, -decay]
+
+    if len(tail_g) > 0:
+        tail_avg_g, _ = sig.lfilter(b, a, tail_g, zi=[seed_g * decay])
+        tail_avg_l, _ = sig.lfilter(b, a, tail_l, zi=[seed_l * decay])
+        avg_gains  = np.concatenate([[seed_g], tail_avg_g])
+        avg_losses = np.concatenate([[seed_l], tail_avg_l])
+    else:
         avg_gains  = np.array([seed_g])
         avg_losses = np.array([seed_l])
-    else:
-        # powers[k] = decay^(k+1) for k = 0..m-1
-        powers = decay ** np.arange(1, m + 1, dtype=np.float64)
-
-        # Convolution-based weighted sum:
-        # avg_g[k] = seed * decay^(k+1) + alpha * sum_{j=0}^{k} tail_g[j] * decay^(k-j)
-        weighted_g = tail_g * alpha                              # scale each input by alpha
-        weighted_l = tail_l * alpha
-
-        # cumulative convolution via np.cumsum of (input / decay^j) * decay^k
-        norm_g = np.cumsum(weighted_g / powers)
-        norm_l = np.cumsum(weighted_l / powers)
-
-        avg_gains_tail  = seed_g * powers + norm_g * powers
-        avg_losses_tail = seed_l * powers + norm_l * powers
-
-        avg_gains  = np.concatenate([[seed_g], avg_gains_tail])
-        avg_losses = np.concatenate([[seed_l], avg_losses_tail])
 
     # Pad with NaN for the warm-up window
     full_avg_g = np.full(n, np.nan)
@@ -102,8 +88,8 @@ def generate_multi_factor_quant_signals(
     Signal state machine is fully vectorized — no Python-level row iteration.
     """
     # 1. Macro Trend Guard
-    sma_200      = price_series.rolling(window=trend_filter_window).mean()
-    macro_uptrend = (price_series > sma_200).fillna(False)
+    sma_200       = price_series.rolling(window=trend_filter_window).mean()
+    macro_uptrend = price_series > sma_200
 
     # 2. Wilder RSI
     rsi = calculate_wilder_rsi(price_series, period=rsi_period)
@@ -111,28 +97,25 @@ def generate_multi_factor_quant_signals(
     # 3. Volume Filter
     if volume_series is not None:
         vol_sma        = volume_series.rolling(window=20).mean()
-        volume_confirm = (volume_series > vol_sma * volume_mult).fillna(False)
+        volume_confirm = volume_series > (vol_sma * volume_mult)
     else:
         volume_confirm = pd.Series(True, index=price_series.index)
 
-    # --- Vectorized state machine ---
-    # Warm-up mask: NaN in RSI or SMA — no position possible yet
-    valid = rsi.notna() & macro_uptrend.notna()
+    # Warm-up mask: both RSI and 200-SMA must be valid (post-warmup)
+    valid = rsi.notna() & sma_200.notna()
 
-    buy_cond  = valid & macro_uptrend & (rsi < rsi_buy_threshold) & volume_confirm
-    sell_cond = valid & ((rsi > rsi_sell_threshold) | ~macro_uptrend)
+    buy_cond  = valid & (macro_uptrend == True) & (rsi < rsi_buy_threshold) & (volume_confirm == True)
+    sell_cond = valid & ((rsi > rsi_sell_threshold) | (macro_uptrend == False))
 
-    # Build a raw signal column: +1 on buy trigger, -1 on sell trigger, NaN elsewhere
-    # Then forward-fill to propagate the last known position.
+    # Vectorized state propagation: +1 on buy trigger, 0 on sell trigger, forward-fill holds
     raw = pd.Series(np.nan, index=price_series.index, dtype=float)
     raw[~valid]   = 0.0   # pre-warmup: flat
     raw[buy_cond]  = 1.0
-    raw[sell_cond] = 0.0  # sell overrides buy if both fire simultaneously
+    raw[sell_cond] = 0.0  # sell overrides buy if both trigger simultaneously
 
-    # Forward-fill holds the position between signal events
     signals = raw.ffill().fillna(0.0)
 
-    # Shift by 1 to eliminate lookahead bias
+    # Shift by 1 day to strictly eliminate lookahead bias
     return signals.shift(1).fillna(0.0)
 
 
