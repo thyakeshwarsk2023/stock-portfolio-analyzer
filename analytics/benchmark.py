@@ -17,6 +17,7 @@ def fetch_nifty50_benchmark(period: str = "5y") -> pd.DataFrame:
     """
     Fetches Nifty 50 Total Return benchmark via NIFTYBEES.NS ETF.
     Returns adjusted close prices as a single-column DataFrame labelled 'NIFTY50'.
+    Guarantees a timezone-naive DatetimeIndex for cross-dataset compatibility.
     """
     df = yf.download(_BENCHMARK_TICKER, period=period, progress=False, auto_adjust=True)
 
@@ -29,6 +30,10 @@ def fetch_nifty50_benchmark(period: str = "5y") -> pd.DataFrame:
 
     if isinstance(prices, pd.DataFrame):
         prices = prices.iloc[:, 0]
+
+    # Normalize index to timezone-naive
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
 
     return pd.DataFrame({"NIFTY50": prices}).dropna().ffill()
 
@@ -51,6 +56,13 @@ def evaluate_benchmark_comparison(
     """
     nifty_df = fetch_nifty50_benchmark(period=period)
     nifty_prices = nifty_df["NIFTY50"]
+
+    # Normalize timezones to ensure safe intersection
+    p_idx = portfolio_prices.index.tz_localize(None) if portfolio_prices.index.tz is not None else portfolio_prices.index
+    portfolio_prices = pd.Series(portfolio_prices.values, index=p_idx)
+
+    b_idx = nifty_prices.index.tz_localize(None) if nifty_prices.index.tz is not None else nifty_prices.index
+    nifty_prices = pd.Series(nifty_prices.values, index=b_idx)
 
     common_dates = portfolio_prices.index.intersection(nifty_prices.index)
     if len(common_dates) < 2:

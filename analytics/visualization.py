@@ -92,6 +92,15 @@ def plot_portfolio_dashboard(
     # Row 2: Risk-Return Scatter (left) + Asset Allocation Breakdown (right)
     gs = fig.add_gridspec(3, 2, height_ratios=[1.15, 1.0, 0.95], hspace=0.36, wspace=0.22)
 
+    # Normalize indices to tz-naive to prevent intersection mismatches
+    p_idx = portfolio_series.index.tz_localize(None) if portfolio_series.index.tz is not None else portfolio_series.index
+    portfolio_series = pd.Series(portfolio_series.values, index=p_idx)
+    b_idx = benchmark_series.index.tz_localize(None) if benchmark_series.index.tz is not None else benchmark_series.index
+    benchmark_series = pd.Series(benchmark_series.values, index=b_idx)
+    if strategy_series is not None and not strategy_series.empty:
+        s_idx = strategy_series.index.tz_localize(None) if strategy_series.index.tz is not None else strategy_series.index
+        strategy_series = pd.Series(strategy_series.values, index=s_idx)
+
     # Common index alignment
     common_idx = portfolio_series.index.intersection(benchmark_series.index)
     port_aligned = portfolio_series.loc[common_idx]
@@ -111,7 +120,7 @@ def plot_portfolio_dashboard(
     ax1.set_facecolor(bg_card)
 
     ax1.plot(common_idx, port_wealth, label=f"Portfolio ({rebalance_label})", color=c_green, linewidth=2.4, zorder=4)
-    ax1.plot(common_idx, bench_wealth, label="Nifty 50 Index (Benchmark)", color=c_gold, linewidth=1.8, linestyle="--", zorder=3)
+    ax1.plot(common_idx, bench_wealth, label="Nifty 50 TRI (NIFTYBEES)", color=c_gold, linewidth=1.8, linestyle="--", zorder=3)
 
     if strategy_series is not None and not strategy_series.empty:
         strat_aligned = strategy_series.loc[strategy_series.index.intersection(common_idx)]
@@ -127,7 +136,7 @@ def plot_portfolio_dashboard(
     callout_text = (
         f"Initial Capital : {format_inr_pill(initial_capital)}\n"
         f"Portfolio End   : {format_inr_pill(port_wealth.iloc[-1])} ({port_cagr:+.1%} CAGR)\n"
-        f"Benchmark End   : {format_inr_pill(bench_wealth.iloc[-1])} ({bench_cagr:+.1%} CAGR)"
+        f"Benchmark (TRI) : {format_inr_pill(bench_wealth.iloc[-1])} ({bench_cagr:+.1%} CAGR)"
     )
     ax1.text(
         0.015, 0.93, callout_text,
@@ -154,7 +163,7 @@ def plot_portfolio_dashboard(
 
     ax2.fill_between(common_idx, port_dd * 100, 0, color=c_red, alpha=0.25, label=f"Portfolio Drawdown (Max: {port_dd.min():.1%})", zorder=3)
     ax2.plot(common_idx, port_dd * 100, color=c_red, linewidth=1.4, zorder=4)
-    ax2.plot(common_idx, bench_dd * 100, color=c_gold, linewidth=1.2, linestyle="--", label=f"Nifty 50 Drawdown (Max: {bench_dd.min():.1%})", zorder=3)
+    ax2.plot(common_idx, bench_dd * 100, color=c_gold, linewidth=1.2, linestyle="--", label=f"Nifty 50 TRI Drawdown (Max: {bench_dd.min():.1%})", zorder=3)
 
     # Stress Threshold Reference Lines
     ax2.axhline(-10, color="#484f58", linestyle=":", linewidth=0.9)
@@ -229,10 +238,10 @@ def plot_portfolio_dashboard(
         port_vol = float(np.log(port_aligned / port_aligned.shift(1)).dropna().std() * np.sqrt(252))
         ax4.scatter(port_vol * 100, port_ret * 100, color=c_green, s=180, marker="*", edgecolors=text_primary, linewidth=1.4, zorder=6, label=f"Portfolio ({port_ret:.1%}, {port_vol:.1%})")
 
-        # Benchmark Nifty 50 point
+        # Benchmark Nifty 50 TRI point
         bench_ret = float(np.exp(np.log(bench_aligned / bench_aligned.shift(1)).dropna().mean() * 252) - 1.0)
         bench_vol = float(np.log(bench_aligned / bench_aligned.shift(1)).dropna().std() * np.sqrt(252))
-        ax4.scatter(bench_vol * 100, bench_ret * 100, color=c_gold, s=140, marker="D", edgecolors=text_primary, linewidth=1.1, zorder=6, label=f"Nifty 50 ({bench_ret:.1%}, {bench_vol:.1%})")
+        ax4.scatter(bench_vol * 100, bench_ret * 100, color=c_gold, s=140, marker="D", edgecolors=text_primary, linewidth=1.1, zorder=6, label=f"Nifty 50 TRI ({bench_ret:.1%}, {bench_vol:.1%})")
 
     ax4.set_title("Risk-Return Characteristics (Annualized)", fontsize=11.5, fontweight="bold", pad=10, loc="left")
     ax4.set_xlabel("Annual Volatility (%)", fontsize=9, color=text_secondary)
@@ -309,9 +318,9 @@ def plot_portfolio_dashboard(
         pfig.add_trace(
             go.Scatter(
                 x=common_idx, y=bench_wealth, mode="lines",
-                name="Nifty 50 Index",
+                name="Nifty 50 TRI (NIFTYBEES)",
                 line=dict(color="#d29922", width=1.8, dash="dash"),
-                hovertemplate="<b>Nifty 50</b><br>Date: %{x|%d %b %Y}<br>Value: ₹%{y:,.0f}<extra></extra>"
+                hovertemplate="<b>Nifty 50 TRI</b><br>Date: %{x|%d %b %Y}<br>Value: ₹%{y:,.0f}<extra></extra>"
             ), row=1, col=1
         )
         if strategy_series is not None and not strategy_series.empty:
@@ -339,9 +348,9 @@ def plot_portfolio_dashboard(
         pfig.add_trace(
             go.Scatter(
                 x=common_idx, y=bench_dd * 100, mode="lines",
-                name="Nifty 50 Drawdown",
+                name="Nifty 50 TRI Drawdown",
                 line=dict(color="#d29922", width=1.2, dash="dash"),
-                hovertemplate="<b>Nifty 50 Drawdown</b><br>Date: %{x|%d %b %Y}<br>Depth: %{y:.2f}%<extra></extra>"
+                hovertemplate="<b>Nifty 50 TRI Drawdown</b><br>Date: %{x|%d %b %Y}<br>Depth: %{y:.2f}%<extra></extra>"
             ), row=1, col=2
         )
 
@@ -415,10 +424,10 @@ def plot_portfolio_dashboard(
             )
             pfig.add_trace(
                 go.Scatter(
-                    x=[bench_vol * 100], y=[bench_ret * 100], mode="markers+text", name="Nifty 50",
-                    text=["Nifty 50"], textposition="top right",
+                    x=[bench_vol * 100], y=[bench_ret * 100], mode="markers+text", name="Nifty 50 TRI",
+                    text=["Nifty 50 TRI"], textposition="top right",
                     marker=dict(size=14, symbol="diamond", color="#d29922"),
-                    hovertemplate="<b>Nifty 50 Benchmark</b><br>CAGR: %{y:.2f}%<br>Volatility: %{x:.2f}%<extra></extra>"
+                    hovertemplate="<b>Nifty 50 TRI Benchmark</b><br>CAGR: %{y:.2f}%<br>Volatility: %{x:.2f}%<extra></extra>"
                 ), row=2, col=2
             )
 
