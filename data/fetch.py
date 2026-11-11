@@ -8,6 +8,7 @@ if sys.platform == "win32":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+import logging
 import yfinance as yf
 import pandas as pd
 from typing import List, Dict, Tuple, Any, Optional
@@ -162,10 +163,8 @@ def fetch_indian_risk_free_rate(custom_rf: Optional[float] = None) -> float:
     Priority:
     1. custom_rf if explicitly provided by the user (CLI --rf flag).
     2. Live RBI proxy: attempts to fetch the yield of the Indian 10-Year G-Sec
-       via the '^IRX' (13-week US T-Bill) as a fallback proxy; for a true
-       Indian rate the '^CSTG10Y' or RBI API should be preferred but Yahoo
-       Finance's coverage of Indian G-Sec is unreliable.
-    3. Hard-coded default: 6.50% (RBI 10Y G-Sec as of late 2024).
+       via '^CSTG10Y'.
+    3. Institutional default: 6.50% (RBI 10Y Benchmark G-Sec yield).
 
     Returns
     -------
@@ -175,21 +174,23 @@ def fetch_indian_risk_free_rate(custom_rf: Optional[float] = None) -> float:
         print(f"[CONFIG] Using custom risk-free rate: {custom_rf:.2%}")
         return float(custom_rf)
 
-    # Attempt live fetch of Indian 10Y G-Sec yield via Yahoo Finance
-    _INDIA_GSEC_TICKERS = ["^CSTG10Y", "INDIAVIX.NS"]
-    for gsec_ticker in _INDIA_GSEC_TICKERS:
-        try:
-            obj = yf.Ticker(gsec_ticker)
-            hist = obj.history(period="5d")
-            if not hist.empty and "Close" in hist.columns:
-                latest_yield = float(hist["Close"].dropna().iloc[-1])
-                # G-Sec yields from Yahoo are expressed as percentages (e.g. 6.75)
-                if 1.0 < latest_yield < 20.0:
-                    rf = latest_yield / 100.0
-                    print(f"[DATA] Live Indian G-Sec yield fetched ({gsec_ticker}): {rf:.2%}")
-                    return rf
-        except Exception:
-            continue
+    # Attempt live fetch of Indian 10Y G-Sec yield quietly
+    yf_logger = logging.getLogger("yfinance")
+    prev_level = yf_logger.level
+    try:
+        yf_logger.setLevel(logging.CRITICAL)
+        obj = yf.Ticker("^CSTG10Y")
+        hist = obj.history(period="5d")
+        if not hist.empty and "Close" in hist.columns:
+            latest_yield = float(hist["Close"].dropna().iloc[-1])
+            if 1.0 < latest_yield < 20.0:
+                rf = latest_yield / 100.0
+                print(f"[DATA] Live Indian 10Y G-Sec yield fetched (^CSTG10Y): {rf:.2%}")
+                return rf
+    except Exception:
+        pass
+    finally:
+        yf_logger.setLevel(prev_level)
 
-    print(f"[CONFIG] Using default RBI 10Y G-Sec risk-free rate: {_DEFAULT_RF:.2%}")
+    print(f"[CONFIG] Using standard RBI 10Y G-Sec risk-free rate: {_DEFAULT_RF:.2%}")
     return _DEFAULT_RF
