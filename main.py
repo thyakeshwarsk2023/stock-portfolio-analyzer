@@ -109,6 +109,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulations", type=int, default=10000, help="Number of Monte Carlo simulations")
     parser.add_argument("--tickers", type=str, default="", help="Stock allocations format 'TICKER:WEIGHT,TICKER:WEIGHT'")
     parser.add_argument("--rebalance", type=str, default="quarterly", choices=["none", "quarterly", "monthly", "annually", "daily"], help="Periodic rebalancing frequency")
+    parser.add_argument("--period", type=str, default="5y", help="Historical data lookback period (e.g. 3y, 5y, 7y, 10y)")
+    parser.add_argument("--cov-halflife", type=int, default=126, help="EWMA half-life in trading days for covariance estimation")
+    parser.add_argument("--drift-halflife", type=int, default=None, help="Optional EWMA half-life in trading days for Monte Carlo drift")
+    parser.add_argument("--no-covid-filter", action="store_true", help="Keep Feb-May 2020 COVID-19 outlier window in drift/cov calculations")
     parser.add_argument("--rf", type=float, default=None, help="Custom annual Risk-Free Rate (e.g. 0.065 for 6.5%%)")
     parser.add_argument("--no-plot", action="store_true", help="Skip generating and saving chart figures")
     parser.add_argument("--plot-file", type=str, default="portfolio_report.png", help="Path to save high-res PNG visual report")
@@ -141,7 +145,7 @@ def main():
     
     # 1. Fetch Market Data
     tickers = list(portfolio_config.keys())
-    prices = fetch_nse_data(tickers, period="5y")
+    prices = fetch_nse_data(tickers, period=args.period)
     
     # 2. Portfolio Health Diagnostics
     is_valid, warnings = run_indian_portfolio_checks(prices, portfolio_config)
@@ -157,8 +161,13 @@ def main():
         print("\n[ERROR] Stopping execution due to critical weight validation errors.")
         return
 
-    # 3. Individual Stock Historical Statistics
-    ann_returns, ann_vol, cov_matrix = calculate_nse_metrics(prices)
+    # 3. Individual Stock Historical Statistics & Regime Parameters
+    ann_returns, ann_vol, cov_matrix = calculate_nse_metrics(
+        prices,
+        cov_halflife=args.cov_halflife,
+        filter_covid=not args.no_covid_filter,
+        drift_halflife=args.drift_halflife,
+    )
     
     print("\n--- HISTORICAL ANNUALIZED STATS (NSE DATA) ---")
     stats_df = pd.DataFrame({
@@ -175,7 +184,7 @@ def main():
     print(f"\n================ HISTORICAL RISK & BENCHMARK (NSE - {reb_label}) ================")
     benchmark_df, nifty_norm = evaluate_benchmark_comparison(
         portfolio_prices=portfolio_series,
-        period="5y",
+        period=args.period,
         risk_free_rate=rf
     )
     print(benchmark_df.to_string(index=False))
