@@ -35,6 +35,23 @@ def fetch_nifty50_benchmark(period: str = "5y") -> pd.DataFrame:
     if prices.index.tz is not None:
         prices.index = prices.index.tz_localize(None)
 
+    # Sanitize Yahoo Finance bad ticks / decimal glitches (e.g. Dec 2019 10x error on NIFTYBEES)
+    prices = prices.dropna().sort_index()
+    bad_tick_mask = pd.Series(False, index=prices.index)
+    for lag in (1, 2, 3):
+        prev_ok = prices.shift(lag)
+        for lead in (1, 2, 3):
+            next_ok = prices.shift(-lead)
+            # Detect temporary drops > 65% that revert > 200% within 3 days
+            bad_tick_mask |= (prices < prev_ok * 0.35) & (next_ok > prices * 3.0)
+            # Detect temporary spikes > 200% that revert > 65% within 3 days
+            bad_tick_mask |= (prices > prev_ok * 3.0) & (next_ok < prices * 0.35)
+
+    if bad_tick_mask.any():
+        bad_dates = [d.strftime("%Y-%m-%d") for d in prices.index[bad_tick_mask]]
+        print(f"[DATA] Repaired {int(bad_tick_mask.sum())} Yahoo Finance bad tick(s) in {_BENCHMARK_TICKER}: {bad_dates}")
+        prices = prices.mask(bad_tick_mask).interpolate(method="linear")
+
     return pd.DataFrame({"NIFTY50": prices}).dropna().ffill()
 
 
