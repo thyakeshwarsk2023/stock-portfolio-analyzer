@@ -207,7 +207,8 @@ def main():
         signals_df=portfolio_signals,
         weights_dict=portfolio_config,
         initial_capital=initial_investment,
-        risk_free_rate=rf
+        risk_free_rate=rf,
+        rebalance_freq=rebalance_freq,
     )
     
     print("\n--- MULTI-ASSET PORTFOLIO PERFORMANCE & RISK ---")

@@ -23,25 +23,18 @@ def _rebalance_dates(index: pd.DatetimeIndex, freq: str) -> Set:
         return set(index)
 
     s = pd.Series(index, index=index)
+    shifted = s.shift(-1)
 
     if freq == "monthly":
-        # Month-end: a date is a rebalance day if the next date is in a different month
-        shifted = s.shift(-1)
-        mask = (s.dt.month != shifted.dt.month) | shifted.isna()
+        mask = ((s.dt.month != shifted.dt.month) | (s.dt.year != shifted.dt.year)) & shifted.notna()
         return set(index[mask.values])
 
     if freq == "quarterly":
-        quarter_end_months = {3, 6, 9, 12}
-        shifted = s.shift(-1)
-        mask = (
-            s.dt.month.isin(quarter_end_months) &
-            ((s.dt.month != shifted.dt.month) | shifted.isna())
-        )
+        mask = ((s.dt.quarter != shifted.dt.quarter) | (s.dt.year != shifted.dt.year)) & shifted.notna()
         return set(index[mask.values])
 
     if freq == "annually":
-        shifted = s.shift(-1)
-        mask = (s.dt.year != shifted.dt.year) | shifted.isna()
+        mask = (s.dt.year != shifted.dt.year) & shifted.notna()
         return set(index[mask.values])
 
     # Unknown frequency — fall back to quarterly
