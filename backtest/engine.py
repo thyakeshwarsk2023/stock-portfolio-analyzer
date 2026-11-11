@@ -1,118 +1,120 @@
 # backtest/engine.py
 import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List
 from analytics.risk import calculate_max_drawdown, calculate_sortino_ratio, RISK_FREE_RATE_INDIA
+
+# Indian equity delivery transaction cost breakdown (Zerodha flat-fee scale):
+#   Buy side  : brokerage 0.03% + NSE exchange fee 0.00335% + GST 18% on brokerage
+#   Sell side : above + STT 0.1% (Securities Transaction Tax — sell-only for delivery)
+# Conservative round-trip approximation used below:
+_STT_SELL  = 0.0010   # 0.10% STT — charged on sell value only
+_BUY_COST  = 0.0004   # ~0.04% brokerage + exchange fees on buy side
+_SELL_COST = _STT_SELL + 0.0004   # ~0.14% total on sell side
+_ROUND_TRIP = _BUY_COST + _SELL_COST   # ~0.18% realistic round-trip
+
+
+def _trade_pnls_from_signals(
+    price_col: pd.Series,
+    sig_col: pd.Series,
+) -> List[float]:
+    """
+    Extracts discrete trade P&L percentages from a price series and binary signal column.
+    Uses STT-asymmetric friction: buy_cost on entry, sell_cost on exit.
+    Closes any open position at the final bar.
+    """
+    pnls: List[float] = []
+    in_pos    = False
+    entry_px  = 0.0
+
+    prices = price_col.values
+    sigs   = sig_col.values
+    n      = len(sigs)
+
+    for i in range(n):
+        s = sigs[i]
+        if s == 1.0 and not in_pos:
+            in_pos   = True
+            raw      = prices[i - 1] if i > 0 else prices[0]
+            entry_px = raw * (1.0 + _BUY_COST)
+        elif s == 0.0 and in_pos:
+            in_pos   = False
+            raw      = prices[i - 1] if i > 0 else prices[0]
+            exit_px  = raw * (1.0 - _SELL_COST)
+            pnls.append((exit_px - entry_px) / entry_px)
+
+    if in_pos:
+        exit_px = prices[-1] * (1.0 - _SELL_COST)
+        pnls.append((exit_px - entry_px) / entry_px)
+
+    return pnls
+
+
+def _trade_stats(pnls: np.ndarray) -> Dict[str, float]:
+    total  = len(pnls)
+    wins   = pnls[pnls > 0]
+    losses = pnls[pnls < 0]
+    wr     = len(wins) / total if total > 0 else 0.0
+    aw     = float(wins.mean())   if len(wins)   > 0 else 0.0
+    al     = float(abs(losses.mean())) if len(losses) > 0 else 0.0
+    gp, gl = wins.sum(), abs(losses.sum())
+    pf     = gp / gl if gl > 0 else (99.0 if gp > 0 else 0.0)
+    return {"total": total, "win_rate": wr, "avg_win": aw, "avg_loss": al, "profit_factor": pf,
+            "expectancy": wr * aw - (1 - wr) * al}
 
 
 def run_vectorized_backtest(
     price_series: pd.Series,
     signals: pd.Series,
-    initial_capital: float = 500000.0,
-    cost_per_trade: float = 0.0010,  # 0.10% covers Indian STT, exchange charges & slippage
+    initial_capital: float = 500_000.0,
     execution_timing: str = "close",
 ) -> Dict[str, Any]:
     """
-    Executes a vectorized backtest for a single asset trading strategy.
-    Aligns vectorized daily returns and discrete trade ledger execution timing
-    (signals generated at bar t-1 close execute at bar t-1 close / bar t open).
-    Calculates institutional risk, performance, and trade distribution metrics.
+    Single-asset vectorized backtest with STT-asymmetric friction.
     """
-    # 1. Daily Asset Simple Returns
     daily_returns = price_series.pct_change(fill_method=None).fillna(0.0)
 
-    # 2. Identify Trade Entries and Exits (Transitions)
-    trade_actions = signals.diff().fillna(0.0)
-    is_trade_day = trade_actions != 0.0
+    # Friction: buy_cost on entry bar, sell_cost on exit bar
+    sig_diff   = signals.diff().fillna(0.0)
+    buy_events  = (sig_diff > 0).astype(float) * _BUY_COST
+    sell_events = (sig_diff < 0).astype(float) * _SELL_COST
 
-    # 3. Apply Transaction Friction
-    friction = is_trade_day.astype(float) * cost_per_trade
-    strategy_daily_returns = (signals * daily_returns) - friction
-
-    # 4. Wealth Curves
-    equity_curve = initial_capital * (1.0 + strategy_daily_returns).cumprod()
+    strategy_daily_returns = (signals * daily_returns) - buy_events - sell_events
+    equity_curve   = initial_capital * (1.0 + strategy_daily_returns).cumprod()
     buy_hold_curve = initial_capital * (1.0 + daily_returns).cumprod()
 
-    # 5. Extract Individual Trade Distributions
-    trade_pnls = []
-    in_position = False
-    entry_price = 0.0
+    pnls    = np.array(_trade_pnls_from_signals(price_series, signals))
+    stats   = _trade_stats(pnls)
 
-    for i in range(len(signals)):
-        sig = signals.iloc[i]
-
-        # Buy Entry Transition
-        if sig == 1.0 and not in_position:
-            in_position = True
-            raw_entry = price_series.iloc[i - 1] if i > 0 else price_series.iloc[0]
-            entry_price = raw_entry * (1.0 + cost_per_trade)
-
-        # Sell Exit Transition
-        elif sig == 0.0 and in_position:
-            in_position = False
-            raw_exit = price_series.iloc[i - 1] if i > 0 else price_series.iloc[0]
-            exit_price = raw_exit * (1.0 - cost_per_trade)
-            trade_pnl_pct = (exit_price - entry_price) / entry_price
-            trade_pnls.append(trade_pnl_pct)
-
-    # Close any open trade at the end of the backtest period using the final bar's closing price
-    if in_position and len(price_series) > 0:
-        in_position = False
-        exit_price = price_series.iloc[-1] * (1.0 - cost_per_trade)
-        trade_pnl_pct = (exit_price - entry_price) / entry_price
-        trade_pnls.append(trade_pnl_pct)
-
-    trade_pnls = np.array(trade_pnls)
-
-    # 6. Trade Distribution Stats
-    total_trades = len(trade_pnls)
-    winning_trades = trade_pnls[trade_pnls > 0]
-    losing_trades = trade_pnls[trade_pnls < 0]
-
-    win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0.0
-    avg_win = winning_trades.mean() if len(winning_trades) > 0 else 0.0
-    avg_loss = abs(losing_trades.mean()) if len(losing_trades) > 0 else 0.0
-
-    gross_profits = winning_trades.sum()
-    gross_losses = abs(losing_trades.sum())
-    profit_factor = gross_profits / gross_losses if gross_losses > 0 else (99.0 if gross_profits > 0 else 0.0)
-
-    expectancy = (win_rate * avg_win) - ((1.0 - win_rate) * avg_loss)
-
-    # 7. Portfolio Horizon Metrics
-    years = max(len(price_series) / 252, 0.1)
-    final_val = equity_curve.iloc[-1]
-    bh_final_val = buy_hold_curve.iloc[-1]
-
-    strat_cagr = (final_val / initial_capital) ** (1 / years) - 1.0
-    bh_cagr = (bh_final_val / initial_capital) ** (1 / years) - 1.0
-
-    strat_vol = strategy_daily_returns.std() * np.sqrt(252)
-    sharpe = (strat_cagr - RISK_FREE_RATE_INDIA) / strat_vol if strat_vol > 0 else 0.0
-
-    log_returns = np.log(1.0 + strategy_daily_returns)
-    sortino = calculate_sortino_ratio(log_returns, strat_cagr)
-    mdd = calculate_max_drawdown(equity_curve)
-    calmar = strat_cagr / abs(mdd) if abs(mdd) > 0 else 0.0
+    years       = max(len(price_series) / 252, 0.1)
+    final_val   = float(equity_curve.iloc[-1])
+    bh_final    = float(buy_hold_curve.iloc[-1])
+    strat_cagr  = (final_val / initial_capital) ** (1 / years) - 1.0
+    bh_cagr     = (bh_final  / initial_capital) ** (1 / years) - 1.0
+    strat_vol   = float(strategy_daily_returns.std() * np.sqrt(252))
+    sharpe      = (strat_cagr - RISK_FREE_RATE_INDIA) / strat_vol if strat_vol > 0 else 0.0
+    sortino     = calculate_sortino_ratio(np.log(1 + strategy_daily_returns), strat_cagr)
+    mdd         = calculate_max_drawdown(equity_curve)
+    calmar      = strat_cagr / abs(mdd) if abs(mdd) > 0 else 0.0
 
     return {
-        "Strategy Final Value": final_val,
-        "Buy & Hold Final Value": bh_final_val,
-        "Strategy CAGR": strat_cagr,
-        "Buy & Hold CAGR": bh_cagr,
-        "Strategy Volatility": strat_vol,
-        "Sharpe Ratio": sharpe,
-        "Sortino Ratio": sortino,
-        "Calmar Ratio": calmar,
-        "Max Drawdown": mdd,
-        "Total Trades": total_trades,
-        "Win Rate": win_rate,
-        "Profit Factor": profit_factor,
-        "Expectancy Per Trade": expectancy,
-        "Avg Win": avg_win,
-        "Avg Loss": avg_loss,
-        "Equity Curve": equity_curve,
-        "Buy & Hold Curve": buy_hold_curve,
+        "Strategy Final Value":   final_val,
+        "Buy & Hold Final Value": bh_final,
+        "Strategy CAGR":          strat_cagr,
+        "Buy & Hold CAGR":        bh_cagr,
+        "Strategy Volatility":    strat_vol,
+        "Sharpe Ratio":           sharpe,
+        "Sortino Ratio":          sortino,
+        "Calmar Ratio":           calmar,
+        "Max Drawdown":           mdd,
+        "Total Trades":           stats["total"],
+        "Win Rate":               stats["win_rate"],
+        "Profit Factor":          stats["profit_factor"],
+        "Expectancy Per Trade":   stats["expectancy"],
+        "Avg Win":                stats["avg_win"],
+        "Avg Loss":               stats["avg_loss"],
+        "Equity Curve":           equity_curve,
+        "Buy & Hold Curve":       buy_hold_curve,
     }
 
 
@@ -120,163 +122,140 @@ def run_portfolio_vectorized_backtest(
     prices_df: pd.DataFrame,
     signals_df: pd.DataFrame,
     weights_dict: Dict[str, float],
-    initial_capital: float = 500000.0,
-    cost_per_trade: float = 0.0010,
+    initial_capital: float = 500_000.0,
     risk_free_rate: float = RISK_FREE_RATE_INDIA,
 ) -> Dict[str, Any]:
     """
-    Multi-asset portfolio backtest with dynamic cash de-risking.
+    Multi-asset portfolio backtest using a capital-bucket model.
 
-    When a signal for asset i is 0, the capital allocated to that asset
-    earns the daily risk-free rate instead of market returns.  When the
-    signal is 1, it earns the asset's simple daily return.
+    Capital model (fixes implicit daily rebalancing)
+    ------------------------------------------------
+    Each asset i is allocated a fixed capital bucket of w_i * initial_capital.
+    Within its bucket, the asset grows by its daily market return when
+    signal=1 (invested), or by the daily Rf rate when signal=0 (cash).
+    Buckets never cross-rebalance — their sizes drift independently.
+    Total portfolio equity = sum of all bucket values.
 
-    Portfolio daily return at day t:
-        R_p(t) = sum_i  w_i * [ sig_i(t) * r_i(t) + (1 - sig_i(t)) * Rf_daily ]
-                 - cost * |sig_i(t) - sig_i(t-1)|   (transaction friction)
+    This eliminates the daily-rebalancing artifact of the previous
+    return-based model (which applied fixed weights every day, implying
+    a continuous rebalance not present in real execution).
 
-    Parameters
-    ----------
-    prices_df       : DataFrame of adjusted close prices (date index, ticker cols).
-    signals_df      : DataFrame of 0/1 signals aligned with prices_df index.
-    weights_dict    : {ticker: target_weight} allocation.
-    initial_capital : Starting portfolio value in INR.
-    cost_per_trade  : Round-trip friction per trade event (default 0.10%).
-    risk_free_rate  : Annual Rf rate; converted to daily for cash return.
-
-    Returns
-    -------
-    Dict containing portfolio equity curve, buy-and-hold curve, all risk
-    metrics, per-asset trade breakdown, and aggregate trade statistics.
+    Friction model: STT-asymmetric
+    --------------------------------
+    - Entry  : _BUY_COST  applied to the bucket value on signal 0->1 transition.
+    - Exit   : _SELL_COST applied to the bucket value on signal 1->0 transition.
     """
     tickers = [t for t in weights_dict if t in prices_df.columns]
     weights = np.array([weights_dict[t] for t in tickers])
     rf_daily = risk_free_rate / 252.0
 
-    # Align signals and prices on common index
     common_idx = prices_df.index.intersection(signals_df.index)
     prices = prices_df[tickers].loc[common_idx]
-    sigs = signals_df[tickers].loc[common_idx].fillna(0.0)
+    sigs   = signals_df[tickers].loc[common_idx].fillna(0.0)
 
-    daily_asset_returns = prices.pct_change(fill_method=None).fillna(0.0)
+    n      = len(common_idx)
+    n_a    = len(tickers)
 
-    # Transaction friction: triggered whenever signal changes state per asset
-    sig_changes = sigs.diff().fillna(0.0).abs()
-    friction_df = sig_changes * cost_per_trade
+    # --- Capital buckets ---
+    # bucket[i] = INR value of asset i's allocation
+    bucket      = weights * initial_capital      # (A,) initial allocation
+    port_values = np.empty(n, dtype=np.float64)
 
-    # Strategy return per asset per day: signal * market_return + (1-signal) * Rf
-    strat_asset_returns = (
-        sigs * daily_asset_returns
-        + (1.0 - sigs) * rf_daily
-        - friction_df
-    )
+    daily_ret = prices.pct_change(fill_method=None).fillna(0.0).values   # (T, A)
+    sigs_arr  = sigs.values                                               # (T, A)
 
-    # Weighted portfolio daily return
-    port_daily_returns = (strat_asset_returns * weights).sum(axis=1)
+    for day in range(n):
+        if day > 0:
+            prev_sig = sigs_arr[day - 1]
+            curr_sig = sigs_arr[day]
+            r        = daily_ret[day]              # (A,) today's market return
 
-    # Buy-and-hold (fully invested, no signals): just the weighted market return
-    bh_daily_returns = (daily_asset_returns * weights).sum(axis=1)
+            # Transition frictions applied to bucket value at start of day
+            buy_mask  = (curr_sig > prev_sig)      # 0->1
+            sell_mask = (curr_sig < prev_sig)      # 1->0
 
-    # Wealth curves
-    equity_curve = initial_capital * (1.0 + port_daily_returns).cumprod()
-    bh_curve = initial_capital * (1.0 + bh_daily_returns).cumprod()
+            # Deduct friction from bucket before growth
+            bucket = np.where(buy_mask,  bucket * (1.0 - _BUY_COST),  bucket)
+            bucket = np.where(sell_mask, bucket * (1.0 - _SELL_COST), bucket)
 
-    # ---- Portfolio-level performance metrics ----
-    years = max(len(common_idx) / 252, 0.1)
-    final_val = float(equity_curve.iloc[-1])
-    bh_final_val = float(bh_curve.iloc[-1])
+            # Grow each bucket: invested earns market return, cash earns Rf
+            bucket = bucket * np.where(curr_sig == 1.0, 1.0 + r, 1.0 + rf_daily)
 
-    strat_cagr = (final_val / initial_capital) ** (1.0 / years) - 1.0
-    bh_cagr = (bh_final_val / initial_capital) ** (1.0 / years) - 1.0
+        port_values[day] = bucket.sum()
 
-    strat_vol = float(port_daily_returns.std() * np.sqrt(252))
-    bh_vol = float(bh_daily_returns.std() * np.sqrt(252))
-    sharpe = (strat_cagr - risk_free_rate) / strat_vol if strat_vol > 0 else 0.0
+    equity_curve = pd.Series(port_values, index=common_idx)
 
-    log_returns = np.log(1.0 + port_daily_returns.clip(lower=-0.9999))
-    sortino = calculate_sortino_ratio(log_returns, strat_cagr, risk_free_rate)
-    mdd = calculate_max_drawdown(equity_curve)
-    bh_mdd = calculate_max_drawdown(bh_curve)
-    calmar = strat_cagr / abs(mdd) if abs(mdd) > 0 else 0.0
+    # Buy-and-hold benchmark: same weights, no signals, no rebalancing
+    bh_bucket      = weights * initial_capital
+    bh_values      = np.empty(n, dtype=np.float64)
+    bh_values[0]   = bh_bucket.sum()
+    for day in range(1, n):
+        bh_bucket    *= (1.0 + daily_ret[day])
+        bh_values[day] = bh_bucket.sum()
+    bh_curve = pd.Series(bh_values, index=common_idx)
 
-    # ---- Per-asset trade breakdown ----
-    asset_rows = []
-    all_trade_pnls: list = []
+    # --- Performance metrics ---
+    years       = max(n / 252, 0.1)
+    final_val   = float(equity_curve.iloc[-1])
+    bh_final    = float(bh_curve.iloc[-1])
+    strat_cagr  = (final_val / initial_capital) ** (1.0 / years) - 1.0
+    bh_cagr     = (bh_final  / initial_capital) ** (1.0 / years) - 1.0
+
+    port_dr    = equity_curve.pct_change(fill_method=None).fillna(0.0)
+    bh_dr      = bh_curve.pct_change(fill_method=None).fillna(0.0)
+    strat_vol  = float(port_dr.std() * np.sqrt(252))
+    bh_vol     = float(bh_dr.std() * np.sqrt(252))
+    sharpe     = (strat_cagr - risk_free_rate) / strat_vol if strat_vol > 0 else 0.0
+    sortino    = calculate_sortino_ratio(np.log(1 + port_dr.clip(lower=-0.9999)), strat_cagr, risk_free_rate)
+    mdd        = calculate_max_drawdown(equity_curve)
+    bh_mdd     = calculate_max_drawdown(bh_curve)
+    calmar     = strat_cagr / abs(mdd) if abs(mdd) > 0 else 0.0
+
+    # --- Per-asset trade ledger ---
+    asset_rows:   list = []
+    all_pnls:     list = []
 
     for t, w in zip(tickers, weights):
-        price_col = prices[t]
-        sig_col = sigs[t]
-        trade_pnls: list = []
-        in_pos = False
-        entry_px = 0.0
-
-        for i in range(len(sig_col)):
-            s = sig_col.iloc[i]
-            if s == 1.0 and not in_pos:
-                in_pos = True
-                entry_px = (price_col.iloc[i - 1] if i > 0 else price_col.iloc[0]) * (1 + cost_per_trade)
-            elif s == 0.0 and in_pos:
-                in_pos = False
-                exit_px = (price_col.iloc[i - 1] if i > 0 else price_col.iloc[0]) * (1 - cost_per_trade)
-                trade_pnls.append((exit_px - entry_px) / entry_px)
-
-        # Close open position at final bar
-        if in_pos:
-            exit_px = price_col.iloc[-1] * (1 - cost_per_trade)
-            trade_pnls.append((exit_px - entry_px) / entry_px)
-
-        arr = np.array(trade_pnls)
-        all_trade_pnls.extend(trade_pnls)
-
-        wins = arr[arr > 0]
-        losses = arr[arr < 0]
-        gp = wins.sum()
-        gl = abs(losses.sum())
-
+        raw_pnls = _trade_pnls_from_signals(prices[t], sigs[t])
+        arr      = np.array(raw_pnls)
+        all_pnls.extend(raw_pnls)
+        s = _trade_stats(arr) if len(arr) > 0 else {"total": 0, "win_rate": 0, "avg_win": 0,
+                                                     "avg_loss": 0, "profit_factor": 0, "expectancy": 0}
+        wins   = arr[arr > 0] if len(arr) else np.array([])
+        losses = arr[arr < 0] if len(arr) else np.array([])
         asset_rows.append({
-            "Ticker": t,
-            "Weight": f"{w:.0%}",
-            "Trades": len(arr),
-            "Win Rate": f"{len(wins) / len(arr):.1%}" if len(arr) > 0 else "N/A",
-            "Profit Factor": f"{gp / gl:.2f}" if gl > 0 else ("N/A" if gp == 0 else "inf"),
-            "Avg Win": f"{wins.mean():.2%}" if len(wins) > 0 else "N/A",
-            "Avg Loss": f"{abs(losses.mean()):.2%}" if len(losses) > 0 else "N/A",
+            "Ticker":        t,
+            "Weight":        f"{w:.0%}",
+            "Trades":        s["total"],
+            "Win Rate":      f"{s['win_rate']:.1%}" if s["total"] > 0 else "N/A",
+            "Profit Factor": f"{s['profit_factor']:.2f}" if s["total"] > 0 else "N/A",
+            "Avg Win":       f"{wins.mean():.2%}"        if len(wins)   > 0 else "N/A",
+            "Avg Loss":      f"{abs(losses.mean()):.2%}" if len(losses) > 0 else "N/A",
         })
 
-    asset_breakdown_df = pd.DataFrame(asset_rows)
-
-    # Aggregate trade statistics
-    all_arr = np.array(all_trade_pnls)
-    total_trades = len(all_arr)
-    agg_wins = all_arr[all_arr > 0]
-    agg_losses = all_arr[all_arr < 0]
-    agg_win_rate = len(agg_wins) / total_trades if total_trades > 0 else 0.0
-    agg_avg_win = float(agg_wins.mean()) if len(agg_wins) > 0 else 0.0
-    agg_avg_loss = float(abs(agg_losses.mean())) if len(agg_losses) > 0 else 0.0
-    agg_gp = agg_wins.sum()
-    agg_gl = abs(agg_losses.sum())
-    agg_pf = agg_gp / agg_gl if agg_gl > 0 else (99.0 if agg_gp > 0 else 0.0)
-    agg_expectancy = (agg_win_rate * agg_avg_win) - ((1 - agg_win_rate) * agg_avg_loss)
+    # Aggregate stats
+    agg = _trade_stats(np.array(all_pnls)) if all_pnls else \
+          {"total": 0, "win_rate": 0, "avg_win": 0, "avg_loss": 0, "profit_factor": 0, "expectancy": 0}
 
     return {
-        "Strategy Final Value": final_val,
-        "Buy & Hold Final Value": bh_final_val,
-        "Strategy CAGR": strat_cagr,
-        "Buy & Hold CAGR": bh_cagr,
-        "Strategy Volatility": strat_vol,
-        "Buy & Hold Volatility": bh_vol,
-        "Sharpe Ratio": sharpe,
-        "Sortino Ratio": sortino,
-        "Calmar Ratio": calmar,
-        "Max Drawdown": mdd,
+        "Strategy Final Value":   final_val,
+        "Buy & Hold Final Value": bh_final,
+        "Strategy CAGR":          strat_cagr,
+        "Buy & Hold CAGR":        bh_cagr,
+        "Strategy Volatility":    strat_vol,
+        "Buy & Hold Volatility":  bh_vol,
+        "Sharpe Ratio":           sharpe,
+        "Sortino Ratio":          sortino,
+        "Calmar Ratio":           calmar,
+        "Max Drawdown":           mdd,
         "Buy & Hold Max Drawdown": bh_mdd,
-        "Total Trades": total_trades,
-        "Win Rate": agg_win_rate,
-        "Profit Factor": agg_pf,
-        "Expectancy Per Trade": agg_expectancy,
-        "Avg Win": agg_avg_win,
-        "Avg Loss": agg_avg_loss,
-        "Equity Curve": equity_curve,
-        "Buy & Hold Curve": bh_curve,
-        "Asset Breakdown": asset_breakdown_df,
+        "Total Trades":           agg["total"],
+        "Win Rate":               agg["win_rate"],
+        "Profit Factor":          agg["profit_factor"],
+        "Expectancy Per Trade":   agg["expectancy"],
+        "Avg Win":                agg["avg_win"],
+        "Avg Loss":               agg["avg_loss"],
+        "Equity Curve":           equity_curve,
+        "Buy & Hold Curve":       bh_curve,
+        "Asset Breakdown":        pd.DataFrame(asset_rows),
     }
