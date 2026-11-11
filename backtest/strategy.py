@@ -1,11 +1,70 @@
 # backtest/strategy.py
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
+
+
+def calculate_wilder_rsi(price_series: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Calculates Relative Strength Index (RSI) using J. Welles Wilder's
+    original exponential smoothing (RMA / Wilder's EMA).
+
+    Parameters
+    ----------
+    price_series : pd.Series
+        Historical asset close prices.
+    period : int, default 14
+        RSI lookback window (default 14 periods).
+
+    Returns
+    -------
+    pd.Series
+        RSI values in [0, 100], indexed identically to price_series.
+        First `period` values are NaN.
+    """
+    if len(price_series) <= period:
+        return pd.Series(np.nan, index=price_series.index)
+
+    prices = price_series.values.astype(np.float64)
+    deltas = np.diff(prices)
+
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    n = len(prices)
+    avg_gains = np.full(n, np.nan, dtype=np.float64)
+    avg_losses = np.full(n, np.nan, dtype=np.float64)
+
+    # Initial average: simple mean of the first `period` price changes (Wilder 1978 specification)
+    avg_gains[period] = np.mean(gains[:period])
+    avg_losses[period] = np.mean(losses[:period])
+
+    # Wilder's exponential smoothing: alpha = 1 / period
+    alpha = 1.0 / period
+    for i in range(period + 1, n):
+        avg_gains[i] = avg_gains[i - 1] * (1.0 - alpha) + gains[i - 1] * alpha
+        avg_losses[i] = avg_losses[i - 1] * (1.0 - alpha) + losses[i - 1] * alpha
+
+    # Vectorized RS and RSI calculation
+    rs = np.divide(avg_gains, avg_losses, out=np.zeros_like(avg_gains), where=(avg_losses != 0))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+
+    # Boundary conditions: zero losses -> 100, zero gains -> 0, zero both -> 50
+    zero_both = (avg_gains == 0.0) & (avg_losses == 0.0)
+    zero_losses = (avg_losses == 0.0) & (avg_gains > 0.0)
+    zero_gains = (avg_gains == 0.0) & (avg_losses > 0.0)
+
+    rsi[zero_both] = 50.0
+    rsi[zero_losses] = 100.0
+    rsi[zero_gains] = 0.0
+    rsi[:period] = np.nan
+
+    return pd.Series(rsi, index=price_series.index)
+
 
 def generate_multi_factor_quant_signals(
     price_series: pd.Series,
-    volume_series: pd.Series = None,
+    volume_series: Optional[pd.Series] = None,
     rsi_period: int = 14,
     rsi_buy_threshold: float = 45.0,
     rsi_sell_threshold: float = 70.0,
@@ -15,21 +74,15 @@ def generate_multi_factor_quant_signals(
     """
     Multi-Factor Technical Strategy:
     1. Macro Trend Filter: Price MUST be above 200-day SMA.
-    2. Momentum Trigger: RSI recovering (< 45).
+    2. Momentum Trigger: Wilder's RSI recovering (< 45).
     3. Volume Confirmation: Daily volume > 1.1x 20-day Volume SMA.
     """
     # 1. Macro Trend Guard
     sma_200 = price_series.rolling(window=trend_filter_window).mean()
     macro_uptrend = price_series > sma_200
 
-    # 2. RSI Calculation
-    delta = price_series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.rolling(window=rsi_period).mean()
-    avg_loss = loss.rolling(window=rsi_period).mean()
-    rs = avg_gain / (avg_loss + 1e-8)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    # 2. RSI Calculation via Wilder's Exponential Smoothing (RMA)
+    rsi = calculate_wilder_rsi(price_series, period=rsi_period)
 
     # 3. Volume Filter
     if volume_series is not None:
@@ -104,10 +157,10 @@ def apply_fundamental_quality_filter(
 
     if mkt_cap_cr > 0 and mkt_cap_cr < min_market_cap_cr:
         return False, f"REJECTED ({name}): Market Cap (₹{mkt_cap_cr:.1f} Cr) below ₹{min_market_cap_cr:.0f} Cr limit."
-        
+
     if roe < min_roe:
         return False, f"REJECTED ({name}): ROE ({roe:.1%}) below {min_roe:.0%} threshold."
-        
+
     if pe and (pe > max_pe or pe <= 0):
         return False, f"REJECTED ({name}): Trailing P/E ({pe:.1f}) outside valid range (0 - {max_pe})."
 
@@ -141,11 +194,11 @@ def screen_portfolio_fundamentals(
             min_roe=min_roe,
             max_pe=max_pe
         )
-        
+
         mkt_cap_cr = info.get("marketCap", 0) / 10000000.0 if info.get("marketCap") else 0.0
         roe = info.get("returnOnEquity")
         pe = info.get("trailingPE")
-        
+
         rows.append({
             "Ticker": t,
             "Market Cap (₹ Cr)": f"₹{mkt_cap_cr:,.0f}" if mkt_cap_cr > 0 else "N/A",
@@ -154,7 +207,7 @@ def screen_portfolio_fundamentals(
             "Gate Status": "PASSED" if passed else "REJECTED",
             "Details": reason
         })
-        
+
         if passed:
             passed_tickers.append(t)
         else:
