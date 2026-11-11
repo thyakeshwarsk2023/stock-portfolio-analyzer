@@ -76,9 +76,10 @@ def run_monte_carlo_nse(
     This matches the unit-based logic in calculate_portfolio_series() exactly,
     so historical attribution and forward projection are mechanically consistent.
 
-    Both modes use Itô-corrected drift:  mu_daily - 0.5 * sigma^2_daily
-    and Cholesky-correlated standard normal shocks.
-    Memory is managed with float32 arrays.
+    Both modes use log-space GBM drift:  ln(1 + CAGR_annual) / 252,
+    which already reflects the Itô-adjusted geometric expectation
+    (mu_arith - 0.5 * sigma^2), paired with Cholesky-correlated standard
+    normal shocks. Memory is managed with float32 arrays.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -106,9 +107,9 @@ def run_monte_carlo_nse(
     Z = np.random.normal(size=(trading_days, num_assets, n_simulations)).astype(np.float32)
     correlated_Z = np.einsum("ij,tjk->tik", L, Z)   # (T, A, N)
 
-    # Itô drift per asset: mu_i - 0.5 * sigma_i^2
-    asset_variances = np.diag(daily_cov).astype(np.float32)   # (A,)
-    drift = (daily_mu - 0.5 * asset_variances).astype(np.float32)   # (A,)
+    # annual_returns is geometric CAGR = exp(E[log_ret] * 252) - 1, so daily_mu
+    # already equals (mu_arith - 0.5 * sigma^2); avoid double-subtracting 0.5 * var.
+    drift = daily_mu.astype(np.float32)   # (A,)
 
     # Daily log returns: shape (T, A, N)
     daily_log_ret = drift[np.newaxis, :, np.newaxis] + correlated_Z   # broadcast
