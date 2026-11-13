@@ -38,7 +38,6 @@ def plot_portfolio_dashboard(
     portfolio_series: pd.Series,
     benchmark_series: pd.Series,
     strategy_series: Optional[pd.Series] = None,
-    buy_hold_strategy_series: Optional[pd.Series] = None,
     monte_carlo_df: Optional[pd.DataFrame] = None,
     asset_stats_df: Optional[pd.DataFrame] = None,
     weights_dict: Optional[Dict[str, float]] = None,
@@ -109,9 +108,12 @@ def plot_portfolio_dashboard(
     port_wealth = initial_capital * (port_aligned / port_aligned.iloc[0])
     bench_wealth = initial_capital * (bench_aligned / bench_aligned.iloc[0])
 
-    years_hist = max(len(common_idx) / 252, 0.1)
+    years_hist = max(len(common_idx) / 252.0, 0.1)
     port_cagr = (port_wealth.iloc[-1] / initial_capital) ** (1 / years_hist) - 1.0
     bench_cagr = (bench_wealth.iloc[-1] / initial_capital) ** (1 / years_hist) - 1.0
+
+    start_str = common_idx[0].strftime("%b '%y") if hasattr(common_idx[0], "strftime") else str(common_idx[0])
+    end_str   = common_idx[-1].strftime("%b '%y") if hasattr(common_idx[-1], "strftime") else str(common_idx[-1])
 
     # =========================================================
     # PANEL 1: HISTORICAL WEALTH TRAJECTORY (Full Width)
@@ -127,7 +129,7 @@ def plot_portfolio_dashboard(
         strat_wealth = initial_capital * (strat_aligned / strat_aligned.iloc[0])
         ax1.plot(strat_aligned.index, strat_wealth, label="Multi-Asset Active Strategy (Dynamic Cash De-Risking)", color=c_blue, linewidth=2.0, zorder=5)
 
-    ax1.set_title("Historical Portfolio Wealth Trajectory (5-Year Aligned NSE Data)", fontsize=13, fontweight="bold", pad=12, loc="left")
+    ax1.set_title(f"Historical Portfolio Wealth Trajectory ({years_hist:.1f}-Year Aligned NSE Data: {start_str} \u2013 {end_str})", fontsize=13, fontweight="bold", pad=12, loc="left")
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(format_inr_axis))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
     ax1.grid(True, linestyle=":", alpha=0.5, color=grid_color)
