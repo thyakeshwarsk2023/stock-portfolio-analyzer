@@ -105,54 +105,26 @@ def run_vectorized_backtest(
     signals: pd.Series,
     initial_capital: float = 500_000.0,
     execution_timing: str = "close",
+    risk_free_rate: float = RISK_FREE_RATE_INDIA,
 ) -> Dict[str, Any]:
     """
     Single-asset vectorized backtest with STT-asymmetric friction.
+    Delegates to run_portfolio_vectorized_backtest to ensure identical
+    cash-yield compounding (rf_daily) and transaction-cost mechanics.
     """
-    daily_returns = price_series.pct_change(fill_method=None).fillna(0.0)
+    ticker = str(price_series.name) if hasattr(price_series, "name") and price_series.name else "ASSET"
+    prices_df = pd.DataFrame({ticker: price_series})
+    signals_df = pd.DataFrame({ticker: signals})
+    weights_dict = {ticker: 1.0}
 
-    # Friction: _BUY_COST on entry bar, _SELL_COST on exit bar
-    sig_diff    = signals.diff().fillna(0.0)
-    buy_events  = (sig_diff > 0).astype(float) * _BUY_COST
-    sell_events = (sig_diff < 0).astype(float) * _SELL_COST
-
-    strategy_daily_returns = (signals * daily_returns) - buy_events - sell_events
-    equity_curve   = initial_capital * (1.0 + strategy_daily_returns).cumprod()
-    buy_hold_curve = initial_capital * (1.0 + daily_returns).cumprod()
-
-    pnls  = np.array(_trade_pnls_from_signals(price_series, signals))
-    stats = _trade_stats(pnls)
-
-    years      = max(len(price_series) / 252, 0.1)
-    final_val  = float(equity_curve.iloc[-1])
-    bh_final   = float(buy_hold_curve.iloc[-1])
-    strat_cagr = (final_val / initial_capital) ** (1 / years) - 1.0
-    bh_cagr    = (bh_final  / initial_capital) ** (1 / years) - 1.0
-    strat_vol  = float(strategy_daily_returns.std() * np.sqrt(252))
-    sharpe     = (strat_cagr - RISK_FREE_RATE_INDIA) / strat_vol if strat_vol > 0 else 0.0
-    sortino    = calculate_sortino_ratio(np.log(1 + strategy_daily_returns), strat_cagr)
-    mdd        = calculate_max_drawdown(equity_curve)
-    calmar     = strat_cagr / abs(mdd) if abs(mdd) > 0 else 0.0
-
-    return {
-        "Strategy Final Value":   final_val,
-        "Buy & Hold Final Value": bh_final,
-        "Strategy CAGR":          strat_cagr,
-        "Buy & Hold CAGR":        bh_cagr,
-        "Strategy Volatility":    strat_vol,
-        "Sharpe Ratio":           sharpe,
-        "Sortino Ratio":          sortino,
-        "Calmar Ratio":           calmar,
-        "Max Drawdown":           mdd,
-        "Total Trades":           stats["total"],
-        "Win Rate":               stats["win_rate"],
-        "Profit Factor":          stats["profit_factor"],
-        "Expectancy Per Trade":   stats["expectancy"],
-        "Avg Win":                stats["avg_win"],
-        "Avg Loss":               stats["avg_loss"],
-        "Equity Curve":           equity_curve,
-        "Buy & Hold Curve":       buy_hold_curve,
-    }
+    return run_portfolio_vectorized_backtest(
+        prices_df=prices_df,
+        signals_df=signals_df,
+        weights_dict=weights_dict,
+        initial_capital=initial_capital,
+        risk_free_rate=risk_free_rate,
+        rebalance_freq="none",
+    )
 
 
 def run_portfolio_vectorized_backtest(
@@ -234,6 +206,16 @@ def run_portfolio_vectorized_backtest(
             is_inv    = (curr_sig == 1.0)
             bucket    = _rebalance_buckets_with_friction(bucket, weights, is_inv)
             bh_bucket = _rebalance_buckets_with_friction(bh_bucket, weights, all_invested)
+
+    # Mark-to-market liquidation friction on terminal bar:
+    # Deducts _SELL_COST from open invested holdings so terminal equity reflects
+    # net realizable cash value, matching the closed trade ledger P&L
+    if n > 0:
+        final_sigs = sigs_arr[-1]
+        active_liquidation_fees = float((bucket * np.where(final_sigs == 1.0, _SELL_COST, 0.0)).sum())
+        bh_liquidation_fees     = float((bh_bucket * _SELL_COST).sum())
+        port_values[-1] -= active_liquidation_fees
+        bh_values[-1]   -= bh_liquidation_fees
 
     equity_curve = pd.Series(port_values, index=common_idx)
     bh_curve     = pd.Series(bh_values, index=common_idx)
