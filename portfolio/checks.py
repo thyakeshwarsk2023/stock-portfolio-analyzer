@@ -29,7 +29,8 @@ def run_indian_portfolio_checks(
 
     # Check 2: Negative Weights (Short positions)
     if np.any(weights < 0):
-        warnings.append("WARNING: Negative weights detected. Ensure long-only allocation if intended.")
+        is_valid = False
+        warnings.append("CRITICAL: Negative weights detected. Short positions are not supported in long-only engine.")
 
     # Check 3: Concentration Risk (Herfindahl Index)
     hhi = np.sum(weights ** 2)
@@ -38,7 +39,7 @@ def run_indian_portfolio_checks(
     
     for stock, w in weights_dict.items():
         if w >= 0.35:
-            warnings.append(f"SINGLE-STOCK RISK: '{stock}' comprises {w:.0%} of portfolio (>35% limit).")
+            warnings.append(f"SINGLE-STOCK RISK: '{stock}' comprises {w:.0%} of portfolio (>=35% threshold).")
 
     # Slice only portfolio tickers for return calculations
     sliced_prices = price_df[tickers]
