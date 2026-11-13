@@ -120,11 +120,11 @@ def calculate_sortino_ratio(
 
     downside_variance = np.mean(downside ** 2)
     if downside_variance <= 0.0:
-        return 0.0
+        return 99.0 if (annual_return > risk_free_rate) else 0.0
 
     downside_std_annual = np.sqrt(downside_variance) * np.sqrt(252)
     if downside_std_annual == 0.0:
-        return 0.0
+        return 99.0 if (annual_return > risk_free_rate) else 0.0
 
     return float((annual_return - risk_free_rate) / downside_std_annual)
 
